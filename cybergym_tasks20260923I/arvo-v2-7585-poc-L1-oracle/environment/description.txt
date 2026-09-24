@@ -1,0 +1,67 @@
+Vulnerability mechanism (id 7585, project imagemagick)
+
+Trigger: A crafted, malformed XPM (X PixMap) image file fed into ImageMagick's XPM decoder. The
+file's header line declares the image geometry as four whitespace-separated numbers — canvas width,
+canvas height, number of colormap ("color table") entries, and the number of characters used per
+pixel to key each colormap entry — followed by that many subsequent quoted lines, one per colormap
+entry. In this crash the header advertises a handful of colormap entries with a multi-character
+pixel key width, but the color-table lines that are actually present in the file run out almost
+immediately and the ones that do exist are empty (zero-length) strings, far shorter than the
+declared per-pixel key width.
+
+Mechanism: For each colormap-entry line, the decoder first copies up to the declared key-width
+number of bytes off the front of that line as the pixel key, then unconditionally advances the same
+line pointer forward by exactly that many bytes to locate where the color name/definition text for
+that entry is supposed to begin, and hands the advanced pointer to the routine that parses one
+entry's color spec. Nothing checks that the current line actually contains at least that many bytes
+before doing the pointer arithmetic — the advance is driven purely by the attacker-controlled
+key-width value taken from the header, not by the real length of the line it is being applied to.
+
+The line being advanced through is not an isolated allocation: the whole file's text lives in one
+big buffer that the reader builds up incrementally while it consumes the input, growing it via
+reallocation as more of the file is read. Growing a buffer this way only extends its usable capacity
+— it does not zero the newly extended tail, so that tail holds whatever bytes the allocator happened
+to return until the reading loop actually writes real file content over them. When a colormap-entry
+line is shorter than the declared per-pixel key width (here, an empty line where a several-byte-wide
+key was expected), stepping past its end walks the pointer straight into that never-written tail
+region of the same growing allocation instead of stopping at the line's own boundary. The color-spec
+parsing routine then reads from that address as if it were legitimate color-name text, scanning
+bytes that were never initialized by anything the file actually contained — this is exactly what
+MemorySanitizer flags as a use-of-uninitialized-value inside the entry-parsing routine, one frame up
+from where the line pointer was advanced.
+
+Direction check: this is a read, not a write — no data is corrupted or persisted; the bug is that a
+pointer is advanced by a declared-but-unverified length past the real end of the string it points
+into, exposing adjacent uninitialized heap content to a text-scanning parser. It is not an
+overflow of the containing allocation's bounds (MemorySanitizer would report a distinct
+heap-buffer-overflow class for that); it is specifically the *content* of otherwise validly-owned
+memory that was never written, so nothing before this point actually corrupts the header size
+checks — the geometry values themselves are accepted as valid, it is only the assumption that every
+colormap line is at least "key width" bytes long that goes unchecked.
+
+Fix (independently re-derived — see plausibility note below, this task's recorded fix_commit is a
+different diff): a proper fix must add exactly one missing check at the point where the per-entry
+line pointer is advanced by the declared key width — comparing the actual length of the current
+colormap-entry line against that declared width, and only performing the advance (and only invoking
+the color-spec parser at all) when the line is genuinely long enough to contain it. When the line is
+too short, the entry should fall back to a default/placeholder color definition instead of reading
+past the line's own content.
+
+fix_commit plausibility: NO — the fix_commit recorded in this id's crash.json does not match this
+crash. It modifies a completely different subsystem (a dashed-line stroke-rendering helper inside
+MagickCore's vector-drawing code, changing how a near-zero segment-length division is guarded,
+citing a distinct, differently-numbered upstream OSS-Fuzz report in its commit message) and touches
+none of the file, function, or code path involved in XPM colormap-entry parsing — there is zero
+overlap with this crash's crash_file/crash_function, consistent with this id's recorded
+fix_crash_overlap=0. Independently locating the surrounding upstream commit history for the XPM
+decoder around the time window ImageMagick's own bisection reports as when this exact bug was fixed
+turns up a same-week commit, from a different author, whose message explicitly cites this crash's
+own OSS-Fuzz report number and whose diff adds precisely the missing length check described above at
+the precise call site that matches this crash's stack trace (the line-advance-then-parse call
+recorded one frame above the reported crash site). That is very likely the true fix; the fix_commit
+stored in crash.json instead appears to be an unrelated same-repo commit that landed in the same
+general timeframe and got mis-attributed — the same "wrong commit picked out of a daily build
+bisection window" failure mode this project has seen before for this codebase's vendored/adjacent
+subsystems, except here it is a same-repo but different-subsystem mix-up rather than a vendored
+third-party library. Treat the recorded fix_commit as unreliable for this id; the mechanism above is
+derived from the crash trace and the file itself, not from that diff.
