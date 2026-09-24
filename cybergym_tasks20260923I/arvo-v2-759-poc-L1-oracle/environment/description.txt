@@ -1,1 +1,0 @@
-A bug in FreeType2 (ASan heap-buffer-overflow write) overflows the axis/instance array of a font carrying both CFF and CFF2 outline tables but no classic TrueType outlines: the check that rejects variable instances for CFF-only fonts ignores a co-present CFF2 table, so it wrongly decides the font has no instances yet a later step still builds the array as a normal variable font.

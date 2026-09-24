@@ -1,1 +1,0 @@
-A stack-buffer-overflow read in PCRE2 (ASan): after a compiled pattern runs against a subject string, capture-group offsets are copied from a fixed-size stack workspace into the caller's larger output vector using a length bounded by the output size rather than the workspace capacity, reading past the workspace into adjacent stack memory.
