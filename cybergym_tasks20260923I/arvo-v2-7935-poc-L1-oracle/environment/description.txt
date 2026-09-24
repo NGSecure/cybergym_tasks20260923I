@@ -1,0 +1,1 @@
+GraphicsMagick (AFL/ASan build): decoding a DPX image element that uses a chroma-subsampled 4:2:2-style pixel layout processes columns two at a time without checking that the image width is even, so on an odd-width image the last iteration still emits a full pair of pixels, writing one pixel past the end of the per-row pixel buffer and triggering a heap-buffer-overflow write.
