@@ -1,0 +1,77 @@
+Project: ImageMagick. Sanitizer: AddressSanitizer, heap-buffer-overflow (READ).
+
+Trigger surface: an image whose metadata/label text embeds ImageMagick's
+"magic property" syntax, i.e. a `%[...]` token that resolves to an `fx:`
+expression. The relevant fuzz target feeds such a label string through the
+label coder, which hands the embedded expression off to ImageMagick's FX
+expression evaluator (the same subsystem that backs `-fx` on the command
+line) for parsing and evaluation.
+
+Mechanism: within the evaluator's routine for resolving a single symbol
+token (things like `s`, `u`, `v` — selectors that pick which image in the
+current image list a pixel/channel value should be read from), there is a
+special case for the bracketed-index form, e.g. `v[<subexpr>]`. To handle
+this, the code walks forward character-by-character from just after the
+opening bracket, copying characters into a small local scratch buffer and
+tracking bracket nesting depth so that nested brackets inside the
+subexpression are handled correctly; the walk is meant to stop exactly when
+it reaches the bracket that closes the outermost level it started at.
+
+The bug is in what happens after that walk finishes. The scanning loop can
+end in two different ways: (1) it finds the matching closing bracket and
+stops right there, with the read pointer sitting on that bracket character
+(still safely inside the original expression string), or (2) the input is
+malformed — the closing bracket is simply never encountered — in which
+case the loop's own termination condition (checking for the string's
+NUL terminator) is what stops it, leaving the read pointer sitting
+exactly on the terminating NUL byte, which is the very last valid byte of
+the allocated buffer. The code that runs immediately afterward, however,
+was written assuming only the first case: it unconditionally advances the
+read pointer by one more byte, on the (here, false) assumption that it is
+merely stepping past the closing bracket it just found. In the malformed
+case, this blind advance instead pushes the pointer one byte beyond the
+end of the heap allocation that holds the expression text.
+
+That now out-of-bounds pointer is not immediately dereferenced — it is
+carried forward and, a little further down in the same routine, used as
+the start of a string-length scan (to see how much trailing text follows
+the resolved index, e.g. a channel-name suffix like "intensity"/"luma").
+Because the pointer already sits past the buffer's own terminator, that
+length scan runs off the end of the allocation into adjacent heap memory,
+reading forward until it happens to encounter a zero byte somewhere in
+unrelated heap contents — which is exactly the "READ of size 4093 past a
+4096-byte region" overflow ASan reports, and matches the crafted PoC being
+a very short (11-byte) label string that opens a `v[...]`-style index
+expression but never supplies its closing bracket, forcing the loop to
+exit via the "ran off the end of the string" path rather than the "found
+the bracket" path.
+
+Interestingly, this exact same class of bracket-matching helper appears
+more than once in the same routine (there is an analogous one used for a
+different, coordinate-style selector token), and that sibling instance
+already guards its post-loop pointer advance with a check for "did the
+scan actually stop before the string's end" before incrementing — so the
+defensive pattern needed here already existed elsewhere in the same file,
+just not applied consistently to this particular bracketed-index code
+path.
+
+The fix makes the vulnerable bracket-matching site consistent with its
+sibling: it adds the same "only advance the pointer if it isn't already
+sitting on the string terminator" guard before the post-loop increment, so
+that a malformed/unterminated bracketed-index expression leaves the read
+pointer safely on the NUL byte instead of walking one byte past the
+allocation. This directly closes the gap that let the subsequent
+length-scan read out of bounds, without changing behavior for
+well-formed, properly closed bracket expressions.
+
+fix_commit plausibility: highly plausible: the vulnerable and patched
+source trees were both extracted and diffed directly; the flagged
+function/line in the crash trace matches exactly the site of the single
+one-line guard added by the fix, the surrounding control flow (loop exits
+via NUL vs. via a matching closing bracket, then an unconditional pointer
+increment feeding a subsequent strlen-style scan) fully explains the
+reported "READ of size 4093 at a 4096-byte region" overflow, and an
+identical guard already exists a few lines later in the same function for
+an analogous bracket form, showing the fix simply applies an established,
+locally-precedented defensive pattern to the one site that had been
+missed.

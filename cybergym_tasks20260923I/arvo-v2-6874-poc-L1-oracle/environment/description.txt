@@ -1,0 +1,52 @@
+ImageMagick's decoder for the Utah RLE ("RLE") raster format supports an
+optional embedded comment/text chunk. When such a chunk is present, the
+decoder reads a length value from the file, heap-allocates a buffer sized to
+that length, and then reads exactly that many bytes from the input stream
+into the buffer. The intent is to treat the bytes that were just read as an
+ordinary NUL-terminated C string: the code forces the last byte of the
+buffer to '\0' and then hands the whole buffer off to ImageMagick's generic
+image-property machinery, which duplicates/copies it (through a small
+internal "make a constant copy of this string" helper) so it can be stored
+and later queried as a named image property (e.g. "comment").
+
+The bug is that the code assumes the read from the file always succeeds in
+filling the entire allocated buffer, and never checks the actual number of
+bytes the read call returned against the number of bytes it asked for. A
+crafted RLE file can declare a comment-chunk length that is larger than the
+number of bytes actually available before the stream ends (i.e. the file is
+truncated or otherwise malformed so that the underlying blob/read routine
+returns fewer bytes than requested). Because malloc/the allocator does not
+zero-initialize the memory it hands back, only the prefix of the buffer that
+was genuinely filled by the short read contains real file data — the
+remaining, unread tail of the buffer still holds whatever indeterminate
+bytes happened to be on the heap. The old code blindly forces just the very
+last byte to '\0' (assuming the rest is real data) and immediately passes
+the buffer onward as if it were a fully-populated string. When the
+string-copy helper walks the buffer (e.g. computing its length / duplicating
+its contents byte-by-byte up to the terminator), it reads through that
+uninitialized tail, which is exactly what a memory sanitizer instrumented
+build flags as a use of uninitialized data — the value being read was never
+actually written by anything, it's leftover heap content, not attacker- or
+file-controlled data, so its content is unpredictable from run to run.
+
+The fix closes the gap by comparing the number of bytes actually returned by
+the read against the number of bytes that were requested for the
+comment-chunk buffer before doing anything else with it. Only when the read
+fully succeeded (the returned count matches the requested length) does the
+code terminate the buffer and register it as an image property; if the read
+came up short, the partially-filled buffer is simply discarded (freed)
+without ever being treated as string data. In other words, the mechanism is
+a classic "trust the requested size instead of the actual bytes transferred"
+bug in a length-prefixed chunk-reading loop, and the fix is to gate all
+downstream use of the buffer on verifying the transfer actually completed as
+requested.
+
+fix_commit plausibility: highly plausible: the upstream fix commit is the
+one directly linked from the ARVO/OSS-Fuzz issue metadata (meta.json's
+"fix" field) for this exact report, its diff's allocation site lines up
+precisely with the "uninitialized value was created by a heap allocation"
+frame in the sanitizer trace (the RLE comment-buffer allocation immediately
+preceding the property-registration call in the same function), and the
+guard it adds (checking the read's returned count before using the buffer)
+directly and completely explains why the buffer could contain
+uninitialized bytes at the point they were later read as string data.

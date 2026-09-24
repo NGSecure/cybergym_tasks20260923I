@@ -1,0 +1,49 @@
+This crash lives in ImageMagick's PDB (Palm Database bitmap) output module — the
+code path used when ImageMagick serializes an already-decoded, in-memory image
+back out into the compact Palm Database bitmap wire format used by old PalmOS
+handhelds. The relevant fuzz target simply loads arbitrary input bytes as some
+image and then asks the PDB module to write that in-memory image back out, so
+the trigger surface is "whatever image the fuzzer happened to construct, run
+through the PDB output path" — not a hand-crafted malformed PDB file being
+parsed on read.
+
+Internally, the writer's run-length compression stage assembles its
+literal/repeat-run output by staging encoded bytes into one small, fixed-size
+(512-byte) scratch buffer before flushing that buffer's contents into the
+final compressed stream via a raw block-copy helper. That scratch buffer comes
+straight from a plain "give me N bytes" heap allocation (not a zeroing one),
+and the surrounding code only explicitly sets the buffer's very first byte
+before entering the per-scanline encoding loop. Every other byte of the buffer
+is expected to become well-defined only as a side effect of the loop's
+bit-packing logic, which builds each output byte incrementally through a
+series of bitwise OR assignments rather than a single, unconditional write.
+
+The problem is that not every position in that scratch buffer is guaranteed to
+receive one of those OR assignments before the flush-to-output step can reach
+it. The encoder has an internal notion of output width that can be rounded up
+past the image's actual pixel-column count (to pad to an alignment boundary),
+and the OR step is skipped entirely for the padding columns beyond the real
+image width — while the counters that track "how many bytes are ready to be
+flushed" keep advancing regardless. That mismatch lets the encoder advance
+past buffer positions that were never OR'd into at all during this call. When
+the run-length helper then does its bulk copy of the pending "literal" bytes
+out of the scratch buffer into the compressed output stream, it copies
+whatever raw bytes happen to be sitting at those never-written positions —
+leftover content from the allocator, not attacker- or caller-controlled data —
+straight into the writer's output. A memory sanitizer flags this the instant
+those leftover, never-initialized bytes are consumed by the copy.
+
+The fix does not touch the OR-based bit-packing logic or the width/column
+padding behavior at all. It simply zero-fills the entire scratch buffer right
+after it is allocated, before the encoding loop runs, so that every byte
+position — including any the OR-loop happens not to touch during a particular
+call — is a deterministic 0 by the time the run-length flush step reads it,
+rather than whatever the allocator happened to leave there. This closes the
+uninitialized-read class of bug without changing the surrounding encoding
+algorithm's behavior in any observable way.
+
+fix_commit plausibility: highly plausible: the fix commit's own message
+directly references this exact OSS-Fuzz issue number, and its only functional
+change is a zero-fill of precisely the buffer whose allocation and later
+block-copy line up with the origin and use frames shown in the sanitizer
+trace.

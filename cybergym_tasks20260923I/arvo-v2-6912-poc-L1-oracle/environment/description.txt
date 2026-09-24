@@ -1,0 +1,41 @@
+In ImageMagick (ASan), simply *pinging* (a metadata-only, no-decode-needed read) a crafted MVG
+(Magick Vector Graphics) document — a small text format describing vector drawing commands, which
+ImageMagick parses even during a lightweight scan — triggers a heap-buffer-overflow write. The
+document defines a single "path" drawing primitive whose data string encodes several distinct
+curved (bezier-style) sub-segments back to back, rather than one long curve.
+
+Before the renderer actually walks a primitive and writes out its resolved points, it first makes a
+rough guess of how many point-array slots that primitive is going to need, and grows a shared
+points buffer to that guessed size. For most primitive kinds this guess is a straightforward
+multiple of the primitive's known coordinate count. For the "path" primitive specifically, though,
+the guess is built differently: it tallies how many separate numeric tokens appear in the path's
+raw text and scales that count by one flat per-token budget. That tally-based guess does not
+reflect how curve interpolation actually behaves — turning any one curved sub-segment into a
+run of many interpolated points is driven by a per-segment, quantum-style expansion (the same kind
+of richer, more generous budget already used elsewhere in the same rendering routine for other
+curved shapes, e.g. circles/arcs/rounded rectangles), not by a flat multiple of raw token count.
+When a path is composed of several separate curve sub-segments, the true number of points produced
+by expanding each of them individually can exceed the simple token-count-based guess by a wide
+margin, even though the total number of raw coordinate tokens looks unremarkable.
+
+Because the shared buffer is only grown to match the too-small guess, the subsequent point-by-point
+write-out of the interpolated curve — which just writes sequentially into the next free slot of that
+buffer, trusting the earlier guess to have been enough — runs past the end of the allocated
+allocation. Each such write is small (a single coordinate/record-sized store), so the corruption
+happens as a clean, immediate out-of-bounds write right at the boundary rather than a large
+sweeping overrun, which is why it surfaces as an 8-byte heap-buffer-overflow WRITE.
+
+The fix changes only the sizing formula used for the "path" primitive's buffer guess, replacing the
+flat per-token multiple with the same curve-aware formula (accounting for the quantum-driven
+per-segment expansion, plus a fixed constant headroom term) that the other curved primitives in the
+same routine already use. With that change, the pre-grown buffer is large enough to hold every point
+the interpolation step actually produces for the same crafted "path" input, so the same document no
+longer walks past the end of the array.
+
+fix_commit plausibility: highly plausible: the vulnerable and fixed source trees differ, in the
+region responsible for estimating the "path" primitive's point budget, exactly by swapping a flat
+per-token multiplier for a curve-aware formula matching the budget already used by neighboring
+curved-primitive cases, which is precisely the kind of undercount that would let a multi-segment
+curved path overrun a buffer sized from that same estimate — consistent in every detail with the
+crash trace's allocation site and overflow site both being inside the same primitive-rendering
+routine, reached through path/bezier tracing.

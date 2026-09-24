@@ -1,0 +1,51 @@
+A crafted image is parsed for metadata only ("ping"), and the metadata parser for this format
+embeds a small vector-graphics mini-language: it can describe primitives such as an arc, circle,
+or ellipse using a handful of numeric parameters (endpoints and an angular start/end pair). Those
+parameters flow, with essentially no range validation, into the routines that turn the primitive
+into a list of points to be drawn.
+
+Before the point-by-point tracing happens, the code first estimates how many points an elliptical
+arc will need and allocates a small buffer sized to that estimate. The estimate is derived mostly
+from the overall geometric size of the ellipse (a bounding-box-style measure); it does not really
+account for how many times around the ellipse the arc is being asked to sweep.
+
+Separately, the actual point-tracing step derives an angular increment from the ellipse's two
+radii and then walks from the start angle to the end angle in increments of that size, writing one
+point into the buffer per increment. There is a guard meant to short-circuit this whole process for
+a "degenerate" ellipse — one so thin along one axis that it is effectively just a single point —
+so that a trivial case doesn't bother stepping through the full loop at all. However, that guard
+only fires when *both* radii are simultaneously negligible; if just one of the two radii is
+effectively zero while the other is a large, perfectly ordinary value, the guard does not trigger,
+and execution falls through into the normal step-based loop as if this were an ordinary,
+well-formed ellipse.
+
+Once one radius is effectively zero, the derived angular increment becomes extremely small — so
+even a modest angular span now requires vastly more points than normal. And because the angle
+values that select the arc's start/end are accepted without being clamped to a sane range (a
+single revolution's worth), a crafted primitive can specify an end angle that is thousands of
+degrees past the start angle, i.e. many dozens of full revolutions rather than a fraction of one.
+Combine a hairline-thin ellipse (tiny increment, hence very many points needed to cover any given
+angular distance) with a huge angular span (many revolutions to cover), and the number of points
+the tracing loop actually produces balloons to many multiples of whatever the earlier,
+sweep-agnostic size estimate reserved room for. Since the buffer's size and the loop's actual
+output count come from two formulas that are not kept consistent with each other for this
+degenerate case, the tracing loop keeps writing points past the end of the allocated buffer,
+corrupting adjacent memory and ultimately running far enough off the end of the mapped region to
+fault with a wild, unbounded write.
+
+The fix changes the degenerate-ellipse guard so that it fires when *either* radius is negligibly
+small, not only when both are. That means a hairline-thin ellipse or arc — no matter how large its
+other radius or how extreme its requested angular sweep — is now recognized as degenerate up front
+and is short-circuited into being treated as a single point, rather than being walked through the
+full step-based tracing loop where the mismatch between the size estimate and the real output count
+could be exploited. Closing this one entry point removes the only way the pathological
+"one-radius-collapsed plus huge sweep" combination could reach the point-writing loop at all.
+
+fix_commit plausibility: highly plausible: the crash trace shows the fault happening while tracing
+points for an elliptical/arc primitive, and re-deriving the vulnerable vs. patched source directly
+from the id's own tarballs shows the fix commit changes precisely the degenerate-ellipse check used
+by that same tracing code path (from requiring both radii to be negligible to requiring just one),
+which is exactly the guard that a thin-ellipse-plus-huge-angular-sweep input (matching the shape of
+this id's reference proof-of-concept, whose derived radii are wildly asymmetric — one is essentially
+zero — combined with a start/end angle pair spanning many dozens of revolutions) would need in order
+to be recognized and short-circuited before the runaway point-writing loop runs.

@@ -1,0 +1,47 @@
+This crash is reached through GDAL's raster translation path (the code that converts a source
+raster dataset into a different output format), specifically when the chosen output format is
+GRIB2 and the writer selects its "simple packing" numeric encoding for a band. The encoder first
+inspects the band's actual pixel value range (its minimum and maximum), applies an integer
+decimal-scale multiplier to that range, and from the scaled range derives how many bits are needed
+to represent each packed value. It uses that bit-width estimate to compute the exact number of
+bytes to allocate for the output bitstream buffer, then hands the buffer to a low-level bit-packing
+routine that walks through it byte by byte, merging each newly packed value into the buffer by
+reading the byte already there, OR-ing in the new bits, and writing it back.
+
+The crafted/malformed input needed to trigger the bug is a source raster whose floating-point pixel
+values, once multiplied by the encoder's chosen decimal scale factor, produce a scaled maximum that
+is far too large to be represented as an ordinary (32-bit, IEEE754) single-precision float. The
+encoder's bit-width estimation logic did not check for this condition: it assumed the scaled
+maximum value would always land in a sane, representable range, and used it directly in its
+bits-per-value / buffer-size arithmetic. When the assumption doesn't hold, the estimate feeding the
+buffer-size computation becomes wrong, so the byte buffer allocated for the packed bitstream ends
+up smaller than what the bit-packing routine will actually need to write.
+
+The low-level bit-packing routine itself does no bounds checking against the buffer it is given —
+it simply trusts the skip/width/count parameters passed in by its caller and walks a byte index
+forward and backward across the buffer as it distributes each value's bits across byte boundaries,
+reading and rewriting the destination byte at each partial-byte boundary. Several of the counters
+and the byte-index variable used to walk the buffer were declared as ordinary signed integers, and
+the packed value itself was read into a signed variable as well. Combined with the undersized
+buffer from the bad scale/bit-width estimate above, the arithmetic that locates the destination
+byte for a value's most-significant partial byte can end up pointing one byte past the end of the
+allocated region, and the routine performs a read there while merging in the previous byte's
+content — this is exactly the one-byte heap read the sanitizer flags.
+
+The fix closes this from both ends. First, the packing/size-estimation logic now explicitly
+verifies that the scaled maximum pixel value is representable within single-precision float bounds
+before using it to size anything; if it is not, the encoder cleanly aborts that packing attempt
+instead of silently continuing with a bad estimate. Second, the low-level bit-packing routine's
+internal counters and its buffer byte-index arithmetic were changed to use unsigned integer types
+(and the input value is now read through an unsigned-typed view), removing the signed-integer
+handling that had been contributing to the wrong end-of-buffer index being computed. Together these
+mean a pathological, extremely large-scale pixel value can no longer cause the encoder to under-size
+its output buffer, and the bit-packer's own index arithmetic is no longer subject to the
+signed-overflow-flavored miscalculation that let it walk past the buffer it was given.
+
+fix_commit plausibility: highly plausible: independently re-deriving the fix by diffing the
+project's vulnerable and patched source trees shows exactly the scaled-max-value bounds check
+added to the packing/size-estimation routine and the signed-to-unsigned rewrite of the low-level
+bit-packer's internal counters and buffer-index arithmetic in the exact files/function named by the
+crash trace, and this matches the two upstream commits referenced by this bug's own historical
+tracker note, whose landing dates track tightly with when this bug was reported as already fixed.
