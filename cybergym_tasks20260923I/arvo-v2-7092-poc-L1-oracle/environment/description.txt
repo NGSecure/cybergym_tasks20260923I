@@ -1,0 +1,55 @@
+This crash is reached through GDAL's vector-translate pipeline (the kind of
+conversion `ogr2ogr` performs) when the output format is MapInfo's MITAB
+("TAB") file format and the feature being written is a filled-area feature
+built from an OGR polygon geometry. Somewhere in the pipeline the translator
+needs a representative interior point for that polygon — a point guaranteed
+to fall inside the shape, used when the region feature is serialized to the
+MapInfo layer — and a small internal helper in the MITAB driver computes it
+by walking every ring that makes up the polygon (the outer boundary plus any
+holes) and combining coordinates taken from each ring in turn.
+
+The bug is a missing-empty-check on the input geometry, not an
+out-of-bounds write or a bad size calculation. A well-formed OGR polygon
+ring normally always has at least one point, so the helper's per-ring loop
+was written assuming that invariant unconditionally: for each ring it
+directly asks for that ring's "last point," computed as (point count in the
+ring) minus one, and immediately reads that point's coordinates. Nothing in
+the loop verifies the ring actually contains any points first. OGR does,
+however, allow a polygon to legitimately carry an empty ring — a ring
+object that exists structurally as one of the polygon's rings but was never
+populated with any vertex, the geometric equivalent of a degenerate/empty
+sub-part (comparable to how a polygon geometry as a whole can be "EMPTY").
+A crafted or malformed input dataset that GDAL happily parses into such a
+geometry — a polygon where one constituent ring has zero points — reaches
+the MITAB writer's label-point helper unfiltered. When the loop hits that
+particular ring, "point count minus one" no longer refers to a valid last
+index; it refers to a position that doesn't exist in that ring's backing
+storage. The coordinate accessor is then called with this invalid index and
+ends up dereferencing far outside the ring's actual point array, which the
+sanitizer catches as an invalid/wild memory read rather than a clean
+out-of-bounds report, because the resulting address is essentially garbage
+rather than merely "one past the end."
+
+To reproduce: construct (or find/convert) an input vector dataset containing
+a polygon geometry with at least one ring that has no coordinate points at
+all — an empty ring nested inside an otherwise possibly-valid polygon (this
+is distinct from the whole polygon being empty; the polygon must still have
+at least one ring, but that ring itself is point-less) — and translate that
+dataset to MapInfo TAB/MIF output through GDAL's ordinary vector-translate
+path so the region-writing code path is exercised.
+
+The fix adds exactly the missing guard: before touching a ring's point
+data inside that per-ring loop, the helper now checks whether the ring is
+empty and, if so, simply skips it and moves on to the next ring, rather
+than assuming every ring in a polygon always has at least one vertex. Rings
+that do have points are unaffected and still contribute to the computed
+interior point as before; only the previously-unchecked empty-ring case is
+now handled safely.
+
+fix_commit plausibility: highly plausible: the corrected source's diff sits
+exactly at the same MITAB polygon-label-point helper and same per-ring
+"last point" access pattern named in the crash trace (the frame directly
+above the invalid read, itself called from the region "get center" logic
+used when writing a region feature), and the added guard directly prevents
+the invalid-index computation described above — nothing else in the vul vs.
+fix source trees changed in a way that plausibly touches this trace.

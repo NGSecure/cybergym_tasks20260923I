@@ -1,0 +1,62 @@
+ImageMagick's PICT (Apple QuickDraw PICT) decoder can be driven into reading a
+pixel value that was never actually written, which MemorySanitizer flags as a
+use-of-uninitialized-value.
+
+Mechanism: while decoding a PICT picture, the reader can encounter an opcode
+that embeds a separate compressed pixmap/tile of image content that needs to
+be layered onto the picture it is assembling. To do that layering, the PICT
+reader hands its in-progress destination canvas to the general-purpose
+image-compositing machinery, which alpha-blends the new tile content onto the
+canvas pixel-by-pixel. That per-pixel blend needs a defined destination
+alpha/opacity value for every pixel it touches, and feeds that value into a
+small helper used to keep the blend's division-like math well-behaved near
+zero. Just before handing the canvas off to the compositor, the PICT reader
+takes a shortcut meant to guarantee the canvas already has a fully-defined,
+fully-opaque alpha channel -- but the way it invokes that "make everything
+opaque" step passes an argument that does not actually correspond to the
+enumerated option the underlying call expects, so the call does not reliably
+force every channel sample of every pixel in the canvas to a defined value the
+way it is meant to. The canvas's pixel storage itself has already been
+heap-allocated by this point, but allocation alone does not initialize memory;
+some of the destination pixels' alpha samples stay in this
+still-heap-allocated-but-never-actually-written state.
+
+A crafted PICT input that includes an embedded pixmap/tile opcode --
+structured so that this canvas-preparation step runs and the subsequent
+per-pixel composite step is reached before every destination alpha sample has
+actually been overwritten with a real value -- is what triggers the crash. No
+bounds are exceeded; the defect is purely that a value read during the blend
+traces back to allocated-but-uninitialized heap memory rather than to
+something the decoder actually wrote.
+
+The fix corrects the one call in the PICT reader responsible for forcing the
+destination canvas fully opaque before compositing, so that it invokes the
+intended, complete initialization behavior instead of the narrower one it had
+been invoking -- after the fix, every alpha sample the compositor can touch
+has already been given a defined value by the time compositing runs.
+
+Note on independence: a sibling id in this batch (arvo 7135) traces to the
+exact same underlying PICT-decoder defect and the exact same fix, reached
+through a different fuzz target execution path: rather than crashing during
+the read/composite step itself, that id's crafted PICT input reaches the
+composite step without the tainted alpha sample being touched during the
+blend math, so the still-undefined byte survives into the fully-decoded
+in-memory image and is only observed later, during a subsequent write/re-encode
+of that same image, when a per-pixel channel-scaling step used for output
+quantization touches it. They are not duplicate reports of one input; they
+are two different crash signatures produced by exercising the same
+root-cause defect through two different observation points (an immediate
+read-side composite vs. a delayed write-side conversion), and should be
+treated as independently constructed reproduction targets, not shortcuts to
+each other's proof-of-concept input.
+
+fix_commit plausibility: highly plausible: OSS-Fuzz's own independent
+fix-confirmation window for this exact issue is a narrow ~24-hour range, and
+the picked commit's timestamp falls inside that window; it is also the
+immediate follow-up (minutes later, same file, same call site) to another
+same-day commit that had already made a first, incomplete attempt at forcing
+full alpha-channel initialization in this exact PICT-reader code path -- i.e.
+the picked commit is the one that finishes correcting a canvas-initialization
+defect the maintainer was actively iterating on that day, at the precise site
+the crash's allocation trace and call chain point to, and no other file is
+touched.

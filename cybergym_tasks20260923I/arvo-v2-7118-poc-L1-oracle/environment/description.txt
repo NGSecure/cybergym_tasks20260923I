@@ -1,0 +1,42 @@
+Project: ImageMagick. Format: TIFF. Sanitizer: MemorySanitizer, use-of-uninitialized-value.
+
+Trigger: a crafted TIFF input whose "rows per strip" tag is either absent from the file's
+directory entries or otherwise fails the library's raw tag-lookup call (as opposed to a
+well-formed strip-encoded TIFF where that tag parses cleanly). The image's other required
+tags (width, height, compression, samples-per-pixel, bits-per-sample, etc.) are present and
+parse fine, so the reader proceeds past the initial header-sanity gate and only runs into
+trouble once it gets to strip-layout handling.
+
+Mechanism: the TIFF-reading routine keeps a local integer meant to hold the number of image
+rows contained in each strip. That local is populated only inside a conditional branch that
+runs when the raw tag-lookup call for this specific field reports success; there is no
+default assignment to the variable anywhere before that lookup is attempted. A companion
+sanity check — meant to reject any rows-per-strip value that is implausibly larger than the
+image's own total pixel dimensions (width times height) — was written to live inside that
+very same success-only branch, immediately after the value is read. That pairing means both
+"read the value" and "validate the value" are gated by the identical condition: if the tag
+lookup does not succeed, the routine simply falls through with neither read nor check having
+run, so the local retains whatever indeterminate bytes were already sitting in that stack
+slot from earlier in the call. Nothing downstream distinguishes "value came from the file and
+was validated" from "value was never touched"; the leftover garbage is treated as a
+trustworthy strip-height count and gets threaded into the generic strip-based decoding logic
+that follows. It is a later read of that never-assigned value which the sanitizer flags.
+
+Fix direction: the corrected code closes the gap with two structural changes to the same
+small block, rather than adding a check somewhere else entirely. First, the local is given an
+explicit, well-defined default — derived directly from the image's already-known width and
+height — before the tag lookup is even attempted, so it is never left undefined regardless of
+outcome. Second, the size-sanity comparison is pulled out of the success-only branch and made
+to run unconditionally right after the lookup attempt, so it applies whether or not the tag
+was actually present and parseable. With both changes in place, every code path — tag read
+successfully, or tag missing/unreadable — leaves the variable holding a defined, and now
+always-validated, value before any later strip-decoding step consumes it.
+
+fix_commit plausibility: highly plausible: the OSS-Fuzz tracker independently re-verified this
+exact bug's fixed status against a same-day build, the change directly rewrites the identical
+read-then-check code block for the exact field whose mishandling matches an
+uninitialized-value defect (a validation step that was conditionally skippable, leaving an
+unguarded gap), and it sits inside a tight cluster of same-day follow-up commits — one of
+which is explicitly tagged with this bug's own tracker number — all revising that same block
+rather than touching anything else, so subsequent refinements target the identical defect
+rather than a different one.

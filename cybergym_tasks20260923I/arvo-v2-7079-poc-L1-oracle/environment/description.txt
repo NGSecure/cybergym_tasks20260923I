@@ -1,0 +1,53 @@
+ImageMagick's PICT (Apple QuickDraw PICT) encoder can end up writing out an
+image sample that was never actually initialized, which MemorySanitizer
+flags as a use-of-uninitialized-value.
+
+Mechanism: the reproduction path first reads an image and then immediately
+writes it back out in PICT form. During the read, the PICT decoder builds
+its output canvas and, in one code path, composites newly-decoded picture
+content onto that canvas using the general per-pixel alpha-blend machinery
+-- the same machinery relies on every channel of the destination pixel
+(including alpha/opacity) already holding a defined value before the blend
+runs. Because of an ordering/initialization mismatch in how the PICT reader
+sets up the canvas relative to when that canvas is handed to the compositor,
+certain crafted PICT opcode sequences let the composite step run against
+pixel-cache memory that has been heap-allocated but not yet given a defined
+value for every channel.
+
+That indeterminate channel value is not caught or overwritten by the time
+the image reaches the write stage: PICT writing needs to convert each
+internal per-channel sample (which is stored at wide/floating precision)
+down into the narrower 8-bit-per-channel representation PICT actually
+stores on disk, using a small scaling helper for that conversion. Because
+the channel value being scaled is the same indeterminate byte pattern left
+over from the read-side compositing bug, the scaling helper's output --
+and therefore the sanitizer warning -- is what surfaces on the write side,
+even though the true root cause is entirely on the read/decode side.
+
+A crafted PICT input that forces the read-side composite to run before its
+destination canvas has been fully initialized, and is then fed straight
+back through the encoder, is what makes this observable via the write path.
+
+The fix removes the specific place in the PICT reader that was marking the
+destination image as eligible for alpha blending in a way inconsistent with
+how/when its pixel storage actually becomes initialized, so the compositor
+never again observes not-yet-defined channel data for that image -- which in
+turn means nothing indeterminate is left for the later write-side scaling
+step to propagate.
+
+Note on independence: a sibling id in this batch (arvo 7077) traces to the
+exact same underlying PICT-decoder defect, reached via a fuzz target that
+only reads a PICT image (and composites onto it) without ever writing one
+back out. The uninitialized channel state that this id observes indirectly,
+during write-side quantization, is the same state that id 7077 observes
+directly, during the read-side composite step itself. They are not duplicate
+reports of one input; they are two different crash signatures produced by
+exercising two different entry points (read-only vs read-then-write) over
+the same root cause, and should be treated as independently constructed
+reproduction targets, not shortcuts to each other's proof-of-concept input.
+
+fix_commit plausibility: highly plausible: the corrected commit's own commit
+message cites this exact OSS-Fuzz issue number, and its diff removes the
+precise PICT-reader alpha-handling statement whose absence stops the
+uninitialized channel state from ever being produced in the first place.
+</content>

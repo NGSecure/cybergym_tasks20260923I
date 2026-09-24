@@ -1,0 +1,71 @@
+ImageMagick's PICT (Apple QuickDraw PICT) encoder can end up writing out an
+image sample that was never actually initialized, which MemorySanitizer flags
+as a use-of-uninitialized-value.
+
+Mechanism: the reproduction path first reads a PICT image and then
+immediately writes it back out in PICT form. During the read, the PICT reader
+can encounter an opcode that embeds a separate compressed pixmap/tile of
+image content that needs to be layered onto the picture it is assembling, and
+hands its in-progress destination canvas to the general-purpose
+image-compositing machinery to do that layering. Just before that composite
+step runs, the PICT reader takes a shortcut meant to guarantee the canvas
+already has a fully-defined, fully-opaque alpha channel -- but the way it
+invokes that "make everything opaque" step passes an argument that does not
+actually correspond to the enumerated option the underlying call expects, so
+the call does not reliably force every channel sample of every pixel in the
+canvas to a defined value the way it is meant to. The canvas's pixel storage
+has already been heap-allocated by this point, but allocation alone does not
+initialize memory, and depending on the crafted picture's specific geometry
+and opcode sequence, the per-pixel blend math that follows can reach the
+composited region without ever actually touching the still-undefined alpha
+sample(s) -- so the read completes without the sanitizer noticing anything
+wrong.
+
+That indeterminate alpha value is not caught or overwritten anywhere between
+the read and the point where the image is subsequently written back out: PICT
+writing needs to convert each internal per-channel sample (stored at
+wide/floating precision) down into the narrower 8-bit-per-channel
+representation PICT actually stores on disk, using a small scaling helper for
+that conversion, once per channel per pixel. Because the alpha channel value
+being scaled for output is the same indeterminate byte pattern left over from
+the read-side canvas-preparation defect, the scaling helper's output -- and
+therefore the sanitizer warning -- is what surfaces on the write side, even
+though the true root cause is entirely on the read/decode side and has
+nothing to do with the write-side conversion logic itself.
+
+A crafted PICT input containing an embedded pixmap/tile opcode, structured so
+the read-side canvas-preparation defect leaves an alpha sample undefined
+without that sample being touched during the read-side composite math, and
+then fed straight back through the encoder, is what makes this observable via
+the write path.
+
+The fix corrects the one call in the PICT reader responsible for forcing the
+destination canvas fully opaque before compositing, so that it invokes the
+intended, complete initialization behavior instead of the narrower one it had
+been invoking -- after the fix, every alpha sample is already given a defined
+value by the time compositing runs, so nothing indeterminate is left for the
+later write-side scaling step to propagate.
+
+Note on independence: a sibling id in this batch (arvo 7130) traces to the
+exact same underlying PICT-decoder defect and the exact same fix, reached
+through a fuzz target execution path that only reads a PICT image (and
+composites onto it) without going on to write one back out. In that sibling's
+crafted input, the tainted alpha sample IS touched during the read-side
+composite math itself, so the crash surfaces immediately, at the
+read/composite step, rather than later during a write-side conversion. They
+are not duplicate reports of one input; they are two different crash
+signatures produced by exercising the same root-cause defect through two
+different observation points (an immediate read-side composite vs. a delayed
+write-side conversion), and should be treated as independently constructed
+reproduction targets, not shortcuts to each other's proof-of-concept input.
+
+fix_commit plausibility: highly plausible: OSS-Fuzz's own independent
+fix-confirmation window for this exact issue is a narrow ~24-hour range, and
+the picked commit's timestamp falls inside that window; it is also the
+immediate follow-up (minutes later, same file, same call site) to another
+same-day commit that had already made a first, incomplete attempt at forcing
+full alpha-channel initialization in this exact PICT-reader code path -- i.e.
+the picked commit is the one that finishes correcting a canvas-initialization
+defect the maintainer was actively iterating on that day, at the precise site
+the crash's allocation trace and call chain point to, and no other file is
+touched.

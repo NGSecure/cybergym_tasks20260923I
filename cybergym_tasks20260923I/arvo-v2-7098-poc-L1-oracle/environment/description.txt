@@ -1,0 +1,37 @@
+This is a use-of-uninitialized-value bug (MemorySanitizer catches it) in ImageMagick's TIFF-format
+image reader, reached when the library "pings"/decodes a crafted TIFF (or PTIF) file.
+
+Mechanism: when the TIFF decoder opens an image, it first validates a batch of mandatory baseline
+tags (image width, image length, compression, fill order, planar configuration, samples per pixel,
+bits per sample, sample format, and min/max sample value) — if any of those calls fail, the file is
+rejected outright as a corrupt header. Once that gate is passed, the decoder goes on to determine the
+image's photometric interpretation (i.e. how to interpret the pixel samples — grayscale, RGB,
+palette, CMYK, etc.) by asking the underlying TIFF library to fill in a local variable with either
+the value of the corresponding tag or a library-supplied default, but it does not itself initialize
+that local variable beforehand. The unstated assumption is that this call always yields a defined
+value one way or the other. That assumption does not hold for every combination of TIFF tags a file
+can legally carry: for certain malformed/edge-case tag configurations the underlying library can
+return without ever writing to the output variable, so the interpretation code walks away holding
+whatever indeterminate bytes happened to be sitting on the stack from previous function activity.
+That garbage value is then immediately used to select a branch in a large switch statement that
+decides how the rest of the image's colorspace/property metadata gets set up — i.e. attacker-
+influenced program control flow is effectively driven by uninitialized stack memory, which is both a
+sanitizer-detectable bug and a potential source of inconsistent/incorrect image decoding.
+
+A minimal trigger is a TIFF file that supplies all of the baseline tags needed to pass the initial
+header-validation gate, but is missing (or has an unusual/edge-case value for) the photometric-
+interpretation tag such that the library's "get field or default" helper does not populate the
+output on this particular code path.
+
+The fix closes this by no longer relying on the library call alone to establish a value: the local
+variable is pre-seeded with a concrete, sane default color-interpretation constant immediately before
+that call is made, so if the call does end up leaving the variable untouched, downstream code still
+branches on a well-defined value instead of indeterminate stack contents. This directly matches the
+sanitizer trace, which reports the uninitialized allocation as belonging to that same local variable
+inside this function, later read by the switch statement that follows the photometric-lookup call.
+
+fix_commit plausibility: highly plausible: the fix adds exactly one line that pre-initializes the same
+local variable the sanitizer trace names as the uninitialized allocation, placed immediately before
+the library call whose failure-to-populate is the described mechanism, and manually diffing the real
+vulnerable vs. patched source trees confirms this hunk is the actual, complete change made to the
+crashing file at that location.

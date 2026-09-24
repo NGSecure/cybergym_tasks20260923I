@@ -1,0 +1,46 @@
+ImageMagick's "-fx"-style algebraic expression evaluator, used (among other
+places) when interpolating percent-escapes/property expressions embedded in
+image text such as a LABEL coder's caption text, can be driven to write past
+the end of a fixed-size stack buffer -- an AddressSanitizer
+stack-buffer-overflow WRITE.
+
+Mechanism: the expression evaluator is recursive-descent: it walks an
+expression string, and whenever it needs to isolate a self-contained
+sub-expression (for example the contents of a parenthesized group, or the
+text being evaluated at one level of operator precedence) it copies that
+substring into a local scratch buffer before recursing or looking the result
+up/storing it under a symbolic name. That scratch buffer was declared as a
+fixed-size array sized to a generic "reasonably long string" constant used
+elsewhere in the codebase for things like filenames -- an assumption that any
+single sub-expression fragment encountered during evaluation would always be
+comfortably shorter than that constant.
+
+That assumption does not hold: a crafted image whose textual
+label/caption/property content embeds an expression built from deeply
+nested parentheses and/or operators (so that the recursive evaluator's
+current sub-expression substring grows close to, and then past, the
+buffer's fixed capacity) causes the substring-copy step to write beyond the
+end of that stack array, corrupting adjacent stack memory. The trigger does
+not require any image pixel data to be malformed at all -- only the
+expression text that the property/label-interpolation logic feeds into the
+evaluator needs to be crafted.
+
+The fix removes the fixed-size-buffer assumption entirely: the scratch
+buffer used to hold the current sub-expression is instead allocated
+dynamically, sized to (at least) the length of the expression actually being
+evaluated, so no fixed constant can ever be too small regardless of how
+deeply the expression nests. Because introducing a heap allocation here means
+it must be released on every one of the function's many exit points, the fix
+also introduces a small helper used consistently at each return so the new
+buffer cannot leak. Separately, it reconciles two related recursion-depth
+limit constants -- one local to the evaluator, one a general nesting guard
+used more broadly in the codebase -- widening the narrower, function-local one
+and tightening the broader one so the two now agree on the same cap.
+
+fix_commit plausibility: highly plausible: the corrected commit's own commit
+message is literally a link to this exact OSS-Fuzz issue number, and its diff
+replaces a fixed-size stack array used inside the expression evaluator's
+sub-expression handling with a dynamically-sized allocation -- an exact
+mechanism match for a stack-buffer-overflow WRITE whose overflowed stack
+object is that same sub-expression buffer.
+</content>
