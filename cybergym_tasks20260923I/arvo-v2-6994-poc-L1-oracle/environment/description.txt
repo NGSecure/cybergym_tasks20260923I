@@ -1,0 +1,48 @@
+Vulnerability mechanism (id 6994, project imagemagick)
+
+Trigger: A crafted, malformed Apple PICT (.pict) image file that is first read/decoded by
+ImageMagick and then written back out (re-encoded) to an image file — the round-trip
+read-then-write path used by conversion tools. As with the sibling case, the input's PICT opcode
+stream is truncated, corrupted, or otherwise fails to cover the entire declared pixel canvas of the
+picture during decode.
+
+Mechanism: the root cause is identical to the sibling id described below — ImageMagick's Apple PICT
+decoder sizes and allocates the destination image's pixel storage from the file's declared
+dimensions before it starts interpreting the PICT opcode stream, and the opcode-interpretation loop
+only fills in pixels that drawing/pixel-data opcodes actually cover. Nothing establishes a
+deterministic baseline value for the newly allocated storage first, so a short, corrupt, or
+partially-painting opcode stream leaves some pixel locations holding raw, uninitialized heap bytes
+rather than real image data.
+
+Where this id differs from its sibling is in which downstream consumer exposes the bug. Here, the
+partially-initialized decoded image is not composited during the read — it is instead handed to the
+PICT writer, which walks every pixel of the image to re-encode it into the output file's on-disk
+representation. Because the on-disk pixel word size generally differs from the library's internal
+per-channel pixel representation, the writer calls a small utility helper for each channel of each
+pixel that rescales/converts the internal value down to the output word width. That helper operates
+directly on the channel value it is given; when the channel in question is one of the pixels the
+decoder's opcode loop never actually wrote, the helper performs its scaling arithmetic on
+uninitialized memory, which is what MemorySanitizer flags as a use-of-uninitialized-value.
+
+Fix: The decoder now explicitly resets/clears the freshly allocated pixel storage for the
+destination image to a well-defined state immediately after allocating it and before beginning to
+interpret the PICT opcode stream. This guarantees every pixel — including any never touched by the
+opcode-interpretation loop — holds a deterministic value, so the later re-encode/write pass (or any
+other downstream consumer, e.g. compositing) never touches uninitialized memory regardless of how
+incomplete the input opcode stream was.
+
+Note on independence: This id shares its fix with sibling id 6986, which is a different crash
+signature (a use-of-uninitialized-value inside a pixel-blending/normalization helper invoked during
+read-time image compositing, rather than during a later write/re-encode pass). Both are downstream
+manifestations of the exact same root cause described above — the PICT decoder's failure to
+establish a deterministic baseline for its pixel storage before partially painting it — surfacing
+through two different consumers of that same under-initialized pixel data. They are not independent
+bugs; treat them as two symptoms of one shared defect.
+
+fix_commit plausibility: highly plausible: the upstream OSS-Fuzz/ClusterFuzz report for this id
+independently records the exact same fix commit and regression/fix revision window as this task's
+crash.json, and the corresponding source patch inserts a pixel-storage-clearing step at exactly the
+point in the PICT decoder that matches the allocation-then-partial-paint pattern feeding this crash
+(confirmed via the "uninitialized value was created by" allocation trace in this id's own error.txt,
+which traces back through the same read-time image-sizing step that immediately precedes the
+inserted fix).

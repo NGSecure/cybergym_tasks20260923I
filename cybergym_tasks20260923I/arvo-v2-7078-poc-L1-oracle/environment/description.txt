@@ -1,0 +1,39 @@
+ImageMagick's MVG (Magick Vector Graphics) drawing engine can be made to
+write past the end of a heap buffer while rendering a dashed stroke, an
+AddressSanitizer heap-buffer-overflow WRITE.
+
+Mechanism: MVG lets a caller set a dash pattern (alternating on/off segment
+lengths) on a stroke, then draw a path/polygon/polyline with that stroke
+style applied. To actually render a dashed line, the renderer cannot just
+draw the original path -- it has to walk each vertex of the input primitive
+and synthesize a brand-new, larger set of vertices that trace only the "on"
+portions of the dash pattern, inserting extra vertices at every point where
+the pattern toggles between drawn and skipped. Because the number of extra
+vertices needed depends on how many times the dash pattern toggles along the
+path (which is not simply proportional to the number of input vertices in a
+tight, easily-bounded way), the routine has to allocate its output buffer
+using an estimate of the worst case, before it knows the exact final count.
+
+The bug is that this pre-allocation estimate is not generous enough: for
+certain combinations of vertex count and dash-pattern layout, the number of
+dash-boundary vertices actually generated during the walk can exceed the
+reserved slack in the estimate by a small, fixed number of elements. When
+that happens, the code that copies/writes the generated dash vertices into
+the buffer runs past the allocated end, corrupting adjacent heap memory. A
+crafted MVG document containing a stroked primitive with a dash-pattern /
+vertex-count combination chosen to hit this under-estimate is what triggers
+the overflow -- the fuzz harness that reproduces it feeds MVG content
+through the normal MVG-parsing/drawing entry point.
+
+The fix simply widens the safety margin baked into the size-estimate formula
+used when allocating the output buffer, so the worst-case number of
+dash-boundary vertices that can actually be produced always fits inside the
+allocation, regardless of how the dash pattern lines up against the path's
+vertices.
+
+fix_commit plausibility: highly plausible: the corrected commit's own commit
+message cites this exact OSS-Fuzz issue number, and its diff is a one-line
+change that directly enlarges the allocation inside the dash-expansion
+routine matched by this id's crash signature (heap-buffer-overflow WRITE at
+a bulk-copy into that same buffer).
+</content>

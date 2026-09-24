@@ -1,0 +1,52 @@
+Target: ImageMagick's WPG (WordPerfect Graphics) coder, specifically the level-1 (legacy)
+parsing path used when pinging/reading a `.wpg` file. The parser walks a stream of
+typed records in a loop; two record types are relevant here.
+
+Trigger shape: a WPG level-1 file that first supplies a color-palette record describing
+a very small number of color entries — as few as a single entry — followed by a bitmap
+record whose declared bit-depth field claims 1 bit per pixel (monochrome).
+
+Mechanism: when the palette record is parsed, the coder sets the image's recorded color
+count to whatever the file says (attacker-controlled, can be 1) and allocates a colormap
+array sized to exactly that many entries, populating only the entries the record actually
+supplies — with one entry, only the first colormap slot ever gets a value.
+
+When the subsequent bitmap record arrives, the coder inspects the declared bit depth. If
+the image already has an indexed colormap (from the earlier palette record) but that
+colormap has fewer slots than a "1 bit per pixel" image nominally calls for (two slots,
+index 0 and index 1, for black/white), the coder grows the colormap buffer up to the
+needed size via a resize helper. That resize call only reallocates memory — it does not
+zero or otherwise initialize the newly added slot(s), and it does not update the image's
+recorded color count to reflect the enlargement.
+
+Immediately after, there is a special-case block that assumes a full two-entry black/white
+palette is in place whenever the bit depth is 1: it reads both colormap index 0 and index 1
+(red/green/blue channels) to decide whether it looks like a "crippled" all-black palette
+that needs index 1 forced to full brightness. This block does not check whether the color
+count actually reflects two real entries — it simply trusts that because bit depth is 1,
+both slots must have been set up somewhere earlier. When the palette record only declared
+one color, index 1 was never assigned by either the palette-record loop or the resize
+call — it is freshly allocated, uninitialized heap memory — so this read observes undefined
+bytes, which is exactly what the memory sanitizer flags as a use of an uninitialized value.
+
+In short: the bug is a mismatch between "how many colormap entries were actually
+initialized" (tracked loosely, driven by the palette record's own declared entry count)
+and "how many colormap entries a later, independently-declared bit-depth field assumes
+exist." Nothing about image dimensions or pixel/raster data needs to be malformed — only
+the ordering and small integer fields of the palette and bitmap records need to be crafted
+so that a colormap is grown without being initialized, and then immediately probed at an
+index beyond what was actually populated.
+
+Fix direction: the monochrome-palette "repair" special case is made conditional on there
+genuinely being more than one recorded color, not just on the declared bit depth being 1.
+That way, when the palette record really only established a single entry, the repair block
+is skipped entirely instead of reading the second, never-initialized colormap slot.
+
+fix_commit plausibility: highly plausible — the fix hunk (verified by diffing the real
+vul/fix source trees, not just trusting the provided patch material) narrows exactly the
+"bit depth == 1" special-case guard by additionally requiring more than one recorded color,
+which directly prevents the code from reading the second colormap slot in precisely the
+single-color-palette scenario that explains the uninitialized-value trace (the read site
+and the earlier allocation site named in the sanitizer trace are both inside the same
+function this hunk modifies, and no other change in the fix touches color/palette handling
+in a way that could otherwise explain the crash).

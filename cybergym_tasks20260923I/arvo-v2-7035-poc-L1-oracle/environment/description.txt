@@ -1,0 +1,52 @@
+This crash is triggered by a crafted, malformed image file in Apple's PICT
+format, fed to ImageMagick's PICT reader and then written back out (e.g. via
+a round-trip read-then-encode operation). The PICT format describes an image
+as a stream of opcodes, some of which declare or redefine the canvas's pixel
+dimensions (its "frame") partway through the file, with subsequent opcodes
+expected to paint the actual pixel content into that region.
+
+The underlying mechanism: whenever the image's pixel dimensions are
+established or changed during decoding, the library (re)allocates the pixel
+storage backing the image — a generic heap buffer obtained from the platform
+allocator. A plain heap allocation does not zero or otherwise define its
+contents; it is raw, previously-unused (or previously-freed) memory. The
+extent-setting code path only allocates this storage — it does not take the
+further step of writing a defined baseline value into every cell before
+control returns to the rest of the decoder. The decoder implicitly assumes
+that anything within the declared extent will end up defined by the opcodes
+that follow, but for a malformed or unusual opcode stream that does not end
+up covering every pixel of the extent it just declared (for example, an
+opcode sequence that is truncated, reordered, or otherwise leaves part of
+the declared region unpainted), some pixel cells are left holding whatever
+bytes happened to already be in that heap memory rather than any
+decoder-produced value.
+
+This defect is latent at read time — nothing crashes or misbehaves yet,
+because the reader never inspects those cells itself. It only becomes
+observable later, when the image is re-encoded: a generic, format-agnostic
+routine deep in the library's pixel pipeline converts each internal
+pixel-channel sample to its output bit-depth as part of writing the image
+back out in PICT form. That routine has no way to know some samples were
+never actually assigned by the decoder; it simply processes whatever bytes
+are sitting in the pixel buffer. Under a memory sanitizer, this shows up as
+a "use of an uninitialized value" at the point the scaling/quantization step
+touches one of the never-written cells, several function calls away from
+where the real defect (the unfilled decode region) actually originated.
+
+The fix addresses this at the point where the image's pixel dimensions are
+(re)established during PICT decoding: immediately after the pixel storage is
+sized for the new extent, an explicit pass is added that writes a defined
+baseline value across the entire freshly-allocated pixel buffer, before any
+further opcode processing or output step can touch it. This closes the
+window in which an opcode stream that fails to paint every pixel of a
+declared region could leave part of the canvas as raw, undefined heap
+memory — every pixel is guaranteed to hold a real value regardless of how
+completely the input file's opcode stream actually paints it.
+
+fix_commit plausibility: highly plausible: the OSS-Fuzz metadata's own
+recorded crash-state fingerprint for this bug is exactly the trace
+ClusterFuzz used to auto-verify this same report as fixed, and it points to
+the PICT reader's extent-handling code — the same place the recorded fix
+commit touches — as the origin of the uninitialized pixel data that the
+write-path scaling helper later reads; there is no alternate fix-commit
+candidate on record for this id.
