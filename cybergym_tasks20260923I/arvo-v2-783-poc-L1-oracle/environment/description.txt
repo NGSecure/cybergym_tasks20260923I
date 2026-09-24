@@ -1,0 +1,1 @@
+A bug in PCRE2 (ASan stack-buffer-overflow write) occurs when a compiled regex with an unusually large number of capturing groups is run: the fixed on-stack scratch area is sized for a typical pattern, so initializing the per-group bookkeeping state overruns that stack allocation by a large margin.

@@ -1,0 +1,1 @@
+A bug in FreeType2 (ASan wild-address write) builds a variable font's named-instance preset table wrongly because ambiguous outline-format detection makes the preset count computed early disagree with the count used later when the records are written, overflowing the allocation.
